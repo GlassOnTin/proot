@@ -445,13 +445,22 @@ static int handle_sysexit_end(Tracee *tracee)
 		if (strncmp(name, PREFIX, strlen(PREFIX)) != 0)
 			return 0;
 
+		/* Fail soft on a broken l2s chain (a stub whose .l2s.
+		 * intermediate/final backing file has gone missing — e.g.
+		 * an interrupted dpkg run, or a rootfs copied/tarred without
+		 * the hidden .l2s.* files). Returning the error here would
+		 * propagate it to the guest's stat/lstat, which makes the
+		 * stub un-stat-able and therefore un-rm-able (ls/rm/find all
+		 * fail with an error on it). Leave the real syscall result
+		 * instead, so it behaves like an ordinary dangling symlink
+		 * and can be removed. (GlassHaven/Haven#329.) */
 		intermediate_proc: size = my_readlink(intermediate, final);
 		if (size < 0)
-			return size;
+			return 0;
 
 		final_proc: status = lstat(final,&finalStat);
 		if (status < 0)
-			return status;
+			return 0;
 
 		finalStat.st_nlink = atoi(final + strlen(final) - 4);
 
