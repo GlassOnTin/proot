@@ -77,6 +77,29 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 	if (size >= PATH_MAX)
 		return -ENAMETOOLONG;
 
+	/* Try a real hard link first.  On a filesystem that supports them
+	 * (ext4/f2fs — the norm for Android app-private storage, where the
+	 * rootfs lives) this is exactly what an unwrapped Linux system does,
+	 * and it keeps true hard-link semantics.  The symlink emulation below
+	 * only exists for filesystems without hard-link support; when it runs
+	 * anyway it diverges from real hard links and breaks tools that link a
+	 * file to a backup copy — e.g. dpkg linking a DB file to its "-old"
+	 * backup, which then failed with "error creating new backup file …
+	 * Operation not permitted" (GlassHaven/Haven#324, #328).  Fall back to
+	 * the emulation only when the real link() actually fails (EXDEV, a
+	 * filesystem without hard links, etc.).  A directory source still
+	 * fails with EPERM here, matching both the emulation's own check and a
+	 * real link(2).  */
+	{
+		char newpath[PATH_MAX];
+		size = read_string(tracee, newpath, peek_reg(tracee, CURRENT, link_target_sysarg), PATH_MAX);
+		if (size >= 0 && size < PATH_MAX && link(original, newpath) == 0) {
+			poke_reg(tracee, SYSARG_RESULT, 0);
+			set_sysnum(tracee, PR_void);
+			return 0;
+		}
+	}
+
 	/* Sanity check: directories can't be linked.  */
 	status = lstat(original, &statl);
 	if (status < 0)
