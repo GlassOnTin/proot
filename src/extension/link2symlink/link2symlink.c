@@ -1,5 +1,6 @@
 #include <stdio.h>     /* rename(2), */
 #include <stdlib.h>    /* atoi */
+#include <stdbool.h>   /* bool, */
 #include <unistd.h>    /* symlink(2), symlinkat(2), readlink(2), lstat(2), unlink(2), unlinkat(2)*/
 #include <string.h>    /* str*, strrchr, strcat, strcpy, strncpy, strncmp */
 #include <sys/types.h> /* lstat(2), */
@@ -31,6 +32,48 @@
 static int decrement_link_count(Tracee *tracee, Reg sysarg);
 
 /**
+ * -errno for a failed libc call.  Guaranteed negative even if errno
+ * was left at 0: a negative extension status is poked verbatim into
+ * the guest's result register, so returning a raw -1 surfaces as
+ * EPERM ("Operation not permitted") for *every* failure — the exact
+ * misleading signature of GlassHaven/Haven#324.
+ */
+static int host_errno(void)
+{
+	return errno > 0 ? -errno : -EPERM;
+}
+
+/**
+ * Whether a real link(2) failure means "hard links unavailable here"
+ * (fall back to symlink emulation) as opposed to a real answer the
+ * guest must see (EEXIST, ENOENT, ENOSPC, ...).
+ */
+static bool link_errno_means_unsupported(int err)
+{
+	return (err == EPERM || err == EACCES || err == EXDEV ||
+	        err == EMLINK || err == EOPNOTSUPP || err == ENOSYS ||
+	        err == EROFS);
+}
+
+/**
+ * PROOT_L2S_FORCE override, read once: 1 = always emulate (skip the
+ * real-hard-link fast path; keeps tests deterministic on hosts where
+ * link(2) succeeds), 0 or unset = try a real hard link first.  The
+ * fast path itself is attempted per call — EXDEV/EMLINK are per-path
+ * properties, so a global negative cache would let one /sdcard
+ * attempt permanently degrade linking on the rootfs.
+ */
+static int l2s_force_mode(void)
+{
+	static int mode = -2;
+	if (mode == -2) {
+		const char *env = getenv("PROOT_L2S_FORCE");
+		mode = (env == NULL || env[0] == '\0') ? -1 : (env[0] == '1' ? 1 : 0);
+	}
+	return mode;
+}
+
+/**
  * Copy the contents of the @symlink into @value (nul terminated).
  * This function returns -errno if an error occured, otherwise 0.
  */
@@ -40,10 +83,69 @@ static int my_readlink(const char symlink[PATH_MAX], char value[PATH_MAX])
 
 	size = readlink(symlink, value, PATH_MAX);
 	if (size < 0)
-		return size;
+		return errno > 0 ? -errno : -EINVAL;
 	if (size >= PATH_MAX)
 		return -ENAMETOOLONG;
 	value[size] = '\0';
+
+	return 0;
+}
+
+/**
+ * Fill @base with the default (sibling) intermediate base for
+ * @original: "<dirname(original)>/<PREFIX><name>".  @name must point
+ * at the basename inside @original.  Returns 0 or -ENAMETOOLONG.
+ */
+static int l2s_sibling_base(const char *original, const char *name, char base[PATH_MAX])
+{
+	if (strlen(PREFIX) + strlen(original) + 5 >= PATH_MAX)
+		return -ENAMETOOLONG;
+
+	strncpy(base, original, strlen(original) - strlen(name));
+	base[strlen(original) - strlen(name)] = '\0';
+	strcat(base, PREFIX);
+	strcat(base, name);
+	return 0;
+}
+
+/**
+ * Reserve a free "<base_intermediate>NNNN" name and move @original's
+ * payload to "<reserved>.0002".  The reservation is the intermediate
+ * symlink itself: symlink(2) fails EEXIST atomically on any existing
+ * entry — including a *dangling* one, which the old access(F_OK) scan
+ * wrongly reported as free (and two proot instances could reserve the
+ * same name).  On success fills @intermediate and @final and returns 0;
+ * on failure returns -errno with the reservation released.
+ */
+static int l2s_reserve_and_move(const char *original,
+                                const char base_intermediate[PATH_MAX],
+                                char intermediate[PATH_MAX], char final[PATH_MAX])
+{
+	int suffix = 1;
+	int status;
+
+	for (;;) {
+		if (suffix >= 1000)
+			return -EMLINK;
+		status = snprintf(intermediate, PATH_MAX, "%s%04d", base_intermediate, suffix);
+		if (status < 0 || status >= PATH_MAX)
+			return -ENAMETOOLONG;
+		status = snprintf(final, PATH_MAX, "%s.0002", intermediate);
+		if (status < 0 || status >= PATH_MAX)
+			return -ENAMETOOLONG;
+		if (symlink(final, intermediate) == 0)
+			break;
+		if (errno != EEXIST)
+			return host_errno();
+		suffix++;
+	}
+
+	status = rename(original, final);
+	if (status < 0) {
+		status = host_errno();
+		unlink(intermediate);	/* release the reservation */
+		return status;
+	}
 
 	return 0;
 }
@@ -68,7 +170,7 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 	int status;
 	int link_count;
 	int first_link = 1;
-	int intermediate_suffix = 1;
+	bool used_l2s_dir = false;
 
 	/* Note: this path was already canonicalized.  */
 	size = read_string(tracee, original, peek_reg(tracee, CURRENT, sysarg), PATH_MAX);
@@ -77,35 +179,41 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 	if (size >= PATH_MAX)
 		return -ENAMETOOLONG;
 
-	/* Try a real hard link first.  On a filesystem that supports them
-	 * (ext4/f2fs — the norm for Android app-private storage, where the
-	 * rootfs lives) this is exactly what an unwrapped Linux system does,
-	 * and it keeps true hard-link semantics.  The symlink emulation below
-	 * only exists for filesystems without hard-link support; when it runs
-	 * anyway it diverges from real hard links and breaks tools that link a
-	 * file to a backup copy — e.g. dpkg linking a DB file to its "-old"
-	 * backup, which then failed with "error creating new backup file …
-	 * Operation not permitted" (GlassHaven/Haven#324, #328).  Fall back to
-	 * the emulation only when the real link() actually fails (EXDEV, a
-	 * filesystem without hard links, etc.).  A directory source still
-	 * fails with EPERM here, matching both the emulation's own check and a
-	 * real link(2).  */
-	{
-		char newpath[PATH_MAX];
-		size = read_string(tracee, newpath, peek_reg(tracee, CURRENT, link_target_sysarg), PATH_MAX);
-		if (size >= 0 && size < PATH_MAX && link(original, newpath) == 0) {
-			poke_reg(tracee, SYSARG_RESULT, 0);
-			set_sysnum(tracee, PR_void);
-			return 0;
-		}
-	}
-
 	/* Sanity check: directories can't be linked.  */
 	status = lstat(original, &statl);
 	if (status < 0)
 		return errno > 0 ? -errno : -ENOENT;
 	if (S_ISDIR(statl.st_mode))
 		return -EPERM;
+
+	/* Try a real hard link first — but only for a regular-file source,
+	 * *after* classification: hard-linking an l2s stub would create a
+	 * referent the chain's refcount never learns about.  On a filesystem
+	 * that supports hard links (ext4/f2fs — the norm for Android
+	 * app-private storage, where the rootfs lives) this is exactly what
+	 * an unwrapped Linux system does, and it keeps true hard-link
+	 * semantics.  The symlink emulation diverges from real hard links
+	 * and breaks tools that link a file to a backup copy — e.g. dpkg
+	 * linking a DB file to its "-old" backup (GlassHaven/Haven#324,
+	 * #328).  Fall back to emulation only when errno says "hard links
+	 * unavailable here"; real answers (EEXIST, ENOENT, ENOSPC, ...) go
+	 * back to the guest.  */
+	if (!S_ISLNK(statl.st_mode) && l2s_force_mode() != 1) {
+		char newpath[PATH_MAX];
+		size = read_string(tracee, newpath, peek_reg(tracee, CURRENT, link_target_sysarg), PATH_MAX);
+		if (size < 0)
+			return size;
+		if (size >= PATH_MAX)
+			return -ENAMETOOLONG;
+		if (link(original, newpath) == 0) {
+			poke_reg(tracee, SYSARG_RESULT, 0);
+			set_sysnum(tracee, PR_void);
+			return 0;
+		}
+		if (!link_errno_means_unsupported(errno))
+			return host_errno();
+		/* else fall through to the emulation */
+	}
 
 	/* Check if it is a symbolic link.  */
 	if (S_ISLNK(statl.st_mode)) {
@@ -132,56 +240,66 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 
 		l2s_directory = getenv("PROOT_L2S_DIR");
 		if (l2s_directory != NULL && l2s_directory[0]) {
-			if (strlen(PREFIX) + strlen(l2s_directory) + (strlen(original) - strlen(name)) + 6 >= PATH_MAX)
+			if (strlen(PREFIX) + strlen(l2s_directory) + strlen(name) + 6 >= PATH_MAX)
 				return -ENAMETOOLONG;
 
 			strcpy(intermediate, l2s_directory);
 			if (l2s_directory[strlen(l2s_directory) - 1] != '/') {
 				strcat(intermediate, "/");
 			}
+			strcat(intermediate, PREFIX);
+			strcat(intermediate, name);
+			used_l2s_dir = true;
 		} else {
-			if (strlen(PREFIX) + strlen(original) + 5 >= PATH_MAX)
-				return -ENAMETOOLONG;
-
-			strncpy(intermediate, original, strlen(original) - strlen(name));
-			intermediate[strlen(original) - strlen(name)] = '\0';
+			status = l2s_sibling_base(original, name, intermediate);
+			if (status < 0)
+				return status;
 		}
-		strcat(intermediate, PREFIX);
-		strcat(intermediate, name);
 	}
 
 	if (first_link) {
-		/*Move the original content to the new path. */
-		do {
-			sprintf(new_intermediate, "%s%04d", intermediate, intermediate_suffix);
-			intermediate_suffix++;
-		} while ((access(new_intermediate,F_OK) != -1) && (intermediate_suffix < 1000));
-		strcpy(intermediate, new_intermediate);
-
-		strcpy(final, intermediate);
-		strcat(final, ".0002");
-		status = rename(original, final);
+		/* Move the original content to the new path.  The intermediate
+		 * symlink doubles as an atomic name reservation, and it briefly
+		 * exists before the payload does — every chain reader already
+		 * fail-softs on a dangling intermediate, so the window is
+		 * benign.  */
+		strcpy(new_intermediate, intermediate);
+		status = l2s_reserve_and_move(original, new_intermediate,
+		                              intermediate, final);
+		if (status == -ENOENT && used_l2s_dir) {
+			/* The guest may have deleted the payload directory
+			 * (it is inside the rootfs); recreate it and retry.  */
+			if (mkdir(l2s_directory, 0700) == 0)
+				status = l2s_reserve_and_move(original, new_intermediate,
+				                              intermediate, final);
+		}
+		if ((status == -EXDEV || status == -ENOENT) && used_l2s_dir) {
+			/* PROOT_L2S_DIR is on another filesystem (or is
+			 * unusable): degrade to the sibling placement rather
+			 * than failing the guest's link().  */
+			status = l2s_sibling_base(original, name, new_intermediate);
+			if (status == 0)
+				status = l2s_reserve_and_move(original, new_intermediate,
+				                              intermediate, final);
+		}
 		if (status < 0)
 			return status;
 		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) original, (intptr_t) final);
 		if (status < 0)
 			return status;
 
-		/* Symlink the intermediate to the final file.  */
-		status = symlink(final, intermediate);
-		if (status < 0)
-			return status;
-
 		/* Symlink the original path to the intermediate one.  */
 		status = symlink(intermediate, original);
 		if (status < 0)
-			return status;
+			return host_errno();
 	} else {
 		/*Move the original content to new location, by incrementing count at end of path. */
 		size = my_readlink(intermediate, final);
 		if (size < 0)
 			return size;
 
+		if (strlen(final) < 4)
+			return -EINVAL;
 		link_count = atoi(final + strlen(final) - 4);
 		link_count++;
 
@@ -190,7 +308,7 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 
 		status = rename(final, new_final);
 		if (status < 0)
-			return status;
+			return host_errno();
 		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
 		if (status < 0)
 			return status;
@@ -198,20 +316,17 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		/* Symlink the intermediate to the final file.  */
 		status = unlink(intermediate);
 		if (status < 0)
-			return status;
+			return host_errno();
 		status = symlink(final, intermediate);
 		if (status < 0)
-			return status;
+			return host_errno();
 	}
 
 	/* Perform symlink() operation within PRoot.  */
 	status = read_path(tracee, final, peek_reg(tracee, CURRENT, link_target_sysarg));
-	if (status >= 0) {
-		status = symlink(intermediate, final);
-		if (status < 0) status = -errno;
-	}
+	if (status >= 0)
+		status = symlink(intermediate, final) < 0 ? host_errno() : 0;
 	if (status < 0) {
-		status = -errno;
 		decrement_link_count(tracee, sysarg);
 		return status;
 	}
@@ -277,6 +392,8 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 		return 0;
 	}
 
+	if (strlen(final) < 4)
+		return 0;	/* malformed chain: let the plain unlink proceed */
 	link_count = atoi(final + strlen(final) - 4);
 	link_count--;
 
@@ -287,7 +404,7 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 
 		status = rename(final, new_final);
 		if (status < 0)
-			return status;
+			return host_errno();
 		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
 		if (status < 0)
 			return status;
@@ -297,19 +414,19 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 		/* Symlink the intermediate to the final file.  */
 		status = unlink(intermediate);
 		if (status < 0)
-			return status;
+			return host_errno();
 
 		status = symlink(final, intermediate);
 		if (status < 0)
-			return status;
+			return host_errno();
 	} else {
 		/* If it is the last, delete the intermediate and final */
 		status = unlink(intermediate);
 		if (status < 0)
-			return status;
+			return host_errno();
 		status = unlink(final);
 		if (status < 0)
-			return status;
+			return host_errno();
 		status = notify_extensions(tracee, LINK2SYMLINK_UNLINK, (intptr_t) final, 0);
 		if (status < 0)
 			return status;
