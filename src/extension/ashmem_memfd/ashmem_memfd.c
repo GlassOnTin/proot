@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <signal.h>
+#include <string.h>       /* strcmp, memset,  */
 #include <unistd.h>
 #include <sys/syscall.h>  /* __NR_memfd_create,  */
 #include <linux/ashmem.h> /* ASHMEM_GET_SIZE,  */
