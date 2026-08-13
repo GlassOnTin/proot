@@ -35,9 +35,14 @@ LEFT=$(ls -A "$TMP")
 
 # 4. errno fidelity: missing source is ENOENT (not the old blanket
 #    EPERM from raw -1 returns), directory source is EPERM
-ERR=$(run 'busybox ln missing t' 2>&1) && exit 1
+#    (if-guarded so `sh -e` harness runs survive the expected failures)
+if ERR=$(run 'busybox ln missing t' 2>&1); then
+    echo "ln of a missing source unexpectedly succeeded"; exit 1
+fi
 echo "$ERR" | grep -q "No such file" || { echo "want ENOENT, got: $ERR"; exit 1; }
-ERR=$(run 'busybox mkdir -p d; busybox ln d t2' 2>&1) && exit 1
+if ERR=$(run 'busybox mkdir -p d; busybox ln d t2' 2>&1); then
+    echo "ln of a directory unexpectedly succeeded"; exit 1
+fi
 echo "$ERR" | grep -qi "not permitted" || { echo "want EPERM, got: $ERR"; exit 1; }
 rm -rf "$TMP"/d
 
@@ -46,7 +51,7 @@ rm -rf "$TMP"/d
 for i in 1 2 3; do
     run 'echo x > f; busybox ln f g; busybox rm f g'
 done
-LEFT=$(ls -A "$TMP" | grep '\.l2s\.')
+LEFT=$(ls -A "$TMP" | grep '\.l2s\.' || true)
 [ -z "$LEFT" ] || { echo "chain residue after loop: $LEFT"; exit 1; }
 
 exit 0
